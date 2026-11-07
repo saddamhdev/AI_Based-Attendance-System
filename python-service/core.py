@@ -188,18 +188,9 @@ def find_best_student(
     return {
         "status": status,
         "studentId": student_id,
-        "score": round(
-            best_match["score"],
-            4,
-        ),
-        "secondBestScore": round(
-            second_best_score,
-            4,
-        ),
-        "scoreDifference": round(
-            score_difference,
-            4,
-        ),
+        "score": best_match["score"],
+        "secondBestScore": second_best_score,
+        "scoreDifference": score_difference,
     }
 
 

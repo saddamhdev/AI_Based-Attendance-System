@@ -43,27 +43,53 @@ def embedding(im,face,recognizer):return normalize_embedding(recognizer.feature(
 def health():return {"modelsReady":DETECTOR_MODEL.exists() and RECOGNIZER_MODEL.exists()}
 
 @app.post("/enroll/{student_id}",dependencies=[Depends(auth)])
-def enroll(student_id:str,images:list[UploadFile]=File(...)):
+def enroll(student_id:str,images:list[UploadFile]=File(...),version:str=""):
     student_id=uid(student_id);models()
     if not 5<=len(images)<=10:raise HTTPException(400,"Require 5–10 photos")
     vectors=[];recognizer=create_recognizer()
-    for f in images:
-        im=decode(f);faces=detect(im)
-        if len(faces)!=1:raise HTTPException(400,"Each enrollment image must contain exactly one face")
-        if min(faces[0][2:4])<30:raise HTTPException(400,"Face too small")
-        vectors.append(embedding(im,faces[0],recognizer))
+    for index,f in enumerate(images,1):
+        try:
+            im=decode(f);faces=detect(im)
+            if len(faces)!=1:raise HTTPException(400,"Each enrollment image must contain exactly one face")
+            if min(faces[0][2:4])<30:raise HTTPException(400,"Face too small")
+            vectors.append(embedding(im,faces[0],recognizer))
+        except HTTPException as error:
+            raise HTTPException(error.status_code,f"Photo {index}: {error.detail}") from error
     vector=normalize_embedding(np.mean(vectors,axis=0))
+    suffix="."+version if version else ""
     fd,name=tempfile.mkstemp(dir=DATA,suffix=".npy")
     try:
         with os.fdopen(fd,"wb") as stream:np.save(stream,vector,allow_pickle=False)
-        os.replace(name,DATA/(student_id+".npy"))
+        os.replace(name,DATA/(student_id+suffix+".npy"))
     finally:
         if os.path.exists(name):os.unlink(name)
     return {"studentId":student_id,"acceptedPhotos":len(vectors)}
 
+@app.post("/enroll/{student_id}/activate",dependencies=[Depends(auth)])
+def activate(student_id:str,version:str):
+    student_id=uid(student_id);version=uid(version)
+    source=DATA/(student_id+"."+version+".npy")
+    if not source.exists():raise HTTPException(404,"Staged enrollment not found")
+    temp=DATA/(student_id+".active.tmp")
+    temp.write_text(version,encoding="ascii")
+    os.replace(temp,DATA/(student_id+".active"))
+    return {"activated":True}
+
+@app.get("/enroll/{student_id}/exists",dependencies=[Depends(auth)])
+def exists(student_id:str):
+    student_id=uid(student_id)
+    active=DATA/(student_id+".active")
+    if active.exists():
+        version=active.read_text(encoding="ascii").strip()
+        return {"enrolled":(DATA/(student_id+"."+version+".npy")).exists()}
+    return {"enrolled":(DATA/(student_id+".npy")).exists()}
+
 @app.delete("/enroll/{student_id}",dependencies=[Depends(auth)])
-def delete(student_id:str):
-    (DATA/(uid(student_id)+".npy")).unlink(missing_ok=True)
+def delete(student_id:str,version:str=""):
+    student_id=uid(student_id)
+    if version:version=uid(version)
+    for path in ([DATA/(student_id+"."+version+".npy")] if version else DATA.glob(student_id+"*.npy")):path.unlink(missing_ok=True)
+    if not version:(DATA/(student_id+".active")).unlink(missing_ok=True)
     return {"deleted":True}
 
 @app.post("/recognize",dependencies=[Depends(auth)])
@@ -73,6 +99,10 @@ def recognize(images:list[UploadFile]=File(...),studentIds:str=Form(default=""))
     students={}
     for id in filter(None,studentIds.split(',')):
         id=uid(id);path=DATA/(id+".npy")
+        active=DATA/(id+".active")
+        if active.exists():
+            path=DATA/(id+"."+active.read_text(encoding="ascii").strip()+".npy")
+        else:path=DATA/(id+".npy")
         if path.exists():students[id]=normalize_embedding(np.load(path,allow_pickle=False))
     photos=[];matched=set();blocked=set();recognizer=create_recognizer()
     for file in images:
