@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+target/
+__pycache__/
+*.npy
+*.onnx
+*.jpg
+*.jpeg
+*.png

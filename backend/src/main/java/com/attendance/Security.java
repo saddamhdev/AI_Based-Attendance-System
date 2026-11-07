@@ -1,0 +1,5 @@
+package com.attendance;
+import org.springframework.context.annotation.*;import org.springframework.security.config.annotation.web.builders.HttpSecurity;import org.springframework.security.web.SecurityFilterChain;import org.springframework.security.core.userdetails.*;import org.springframework.security.provisioning.InMemoryUserDetailsManager;import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+@Configuration public class Security {
+@Bean UserDetailsService users(){var e=new BCryptPasswordEncoder();return new InMemoryUserDetailsManager(User.withUsername("admin").password(e.encode(System.getenv("ADMIN_PASSWORD"))).roles("ADMIN").build(),User.withUsername("teacher").password(e.encode(System.getenv("TEACHER_PASSWORD"))).roles("TEACHER").build());}
+@Bean SecurityFilterChain filter(HttpSecurity h)throws Exception{return h.csrf(c->c.disable()).authorizeHttpRequests(a->a.requestMatchers("/api/**").authenticated().anyRequest().denyAll()).httpBasic(b->{}).sessionManagement(s->s.sessionCreationPolicy(org.springframework.security.config.http.SessionCreationPolicy.STATELESS)).build();}}
