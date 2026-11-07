@@ -1,0 +1,16 @@
+# Node
+frontend/node_modules
+frontend/dist
+
+# Java
+backend/target
+
+# Python
+ai-service/.venv
+__pycache__
+*.pyc
+
+# Runtime
+.env
+/tmp
+.DS_Store
