@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import FacePhotoUploader from './FacePhotoUploader';
 
 type Row = Record<string, any>;
 type Api = (path: string, method?: string, body?: any) => Promise<any>;
@@ -63,11 +64,7 @@ export default function StudentPortal({ api, auth, me, onLogout, onPasswordChang
   const [historyTotal, setHistoryTotal] = useState(0);
   const [historyPage, setHistoryPage] = useState(0);
   const [faces, setFaces] = useState<Row[]>([]);
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
-  const [previews, setPreviews] = useState<string[]>([]);
-  const [consent, setConsent] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [savingPhotos, setSavingPhotos] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [password, setPassword] = useState({ current: '', next: '', confirm: '' });
@@ -80,12 +77,6 @@ export default function StudentPortal({ api, auth, me, onLogout, onPasswordChang
     if (applied.toDate) params.set('toDate', applied.toDate);
     return params.toString();
   }, [applied.offeringId, applied.fromDate, applied.toDate]);
-
-  useEffect(() => {
-    const urls = selectedFiles.map(file => URL.createObjectURL(file));
-    setPreviews(urls);
-    return () => urls.forEach(URL.revokeObjectURL);
-  }, [selectedFiles]);
 
   async function load() {
     setLoading(true);
@@ -118,33 +109,15 @@ export default function StudentPortal({ api, auth, me, onLogout, onPasswordChang
     if (!me.mustChangePassword) void load();
   }, [page, query, applied.status, historyPage, me.mustChangePassword]);
 
-  async function submitPhotos(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (selectedFiles.length < 5 || selectedFiles.length > 10) {
-      setError('Select between five and ten photos.');
-      return;
-    }
-    if (!consent) {
-      setError('Read the biometric-use explanation and give explicit consent before submitting photos.');
-      return;
-    }
+  async function submitPhotos(files: File[], submissionId: string, consent: boolean) {
     const body = new FormData();
-    selectedFiles.forEach(file => body.append('images', file));
-    body.append('consent', 'true');
-    setSavingPhotos(true);
-    setError('');
-    setNotice('');
-    try {
-      await api('/student/faces', 'POST', body);
-      setSelectedFiles([]);
-      setConsent(false);
-      setNotice('Photos were processed and submitted for administrator review. They are not active for recognition yet.');
-      await load();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setSavingPhotos(false);
-    }
+    files.forEach(file => body.append('images', file));
+    body.append('submissionId', submissionId);
+    body.append('consent', String(consent));
+    const result = await api('/student/faces', 'POST', body);
+    if (result?.status !== 'PENDING_REVIEW') return result;
+    load().catch(reason => setError(`Submission is pending admin review, but its status list could not be refreshed: ${reason instanceof Error ? reason.message : 'Retry loading the page.'}`));
+    return result;
   }
 
   async function withdrawConsent() {
@@ -319,28 +292,14 @@ export default function StudentPortal({ api, auth, me, onLogout, onPasswordChang
         <section className="card">
           <h2>Biometric photo submissions</h2>
           <p>Face photos are optional. If you choose to use them, the service validates one detectable face per photo. Submitted photos and embeddings are not used for attendance until an administrator verifies your identity and approves them. Consent can be withdrawn at any time.</p>
-          <form onSubmit={submitPhotos}>
-            <label className="upload">Choose 5–10 JPEG or PNG photos
-              <input type="file" accept="image/jpeg,image/png" multiple disabled={savingPhotos}
-                onChange={event => {
-                  const files = Array.from(event.currentTarget.files || []);
-                  event.currentTarget.value = '';
-                  if (files.length > 10) { setError('Choose no more than ten photos.'); return; }
-                  setError(''); setSelectedFiles(files);
-                }} />
-            </label>
-            {selectedFiles.length > 0 && <p>{selectedFiles.length} photo(s) selected</p>}
-            <div className="preview-strip">{previews.map((url, index) => <figure key={url}>
-              <img src={url} alt={`Selected photo ${index + 1}`} />
-              <button type="button" className="secondary" disabled={savingPhotos}
-                onClick={() => setSelectedFiles(current => current.filter((_, fileIndex) => index !== fileIndex))}>Remove</button>
-            </figure>)}</div>
-            <label className="consent-text"><input type="checkbox" checked={consent} onChange={event => setConsent(event.target.checked)} />
-              I consent to processing of these face photos to create a biometric template for attendance matching. I understand this is optional and I can withdraw consent.</label>
-            <button type="submit" disabled={savingPhotos || selectedFiles.length < 5 || selectedFiles.length > 10}>
-              {savingPhotos ? 'Processing photos…' : 'Submit for admin review'}
-            </button>
-          </form>
+          <FacePhotoUploader
+            key={String(me.studentId)}
+            studentId={String(me.studentId)}
+            name={String(dashboard?.profile?.name || me.name)}
+            roll={String(dashboard?.profile?.roll || me.roll)}
+            mode="student"
+            onSubmit={submitPhotos}
+          />
           {dashboard?.profile?.consent && <button className="danger" type="button" disabled={loading} onClick={() => void withdrawConsent()}>Withdraw biometric consent</button>}
         </section>
         <section className="card"><h2>My submissions</h2>

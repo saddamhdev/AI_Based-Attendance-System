@@ -10,6 +10,7 @@ type RecognitionPhoto = {
 };
 type RecognitionResponse = {
   photos: RecognitionPhoto[];
+  thresholdPercentage: number;
 };
 type ReviewPhotoFile = Pick<File, 'name' | 'size' | 'lastModified'>;
 
@@ -32,11 +33,15 @@ export function eligibleAutoSelections(
   recognition: RecognitionResponse,
   sessionId: string,
   rosterStudentIds: Set<string>,
-  threshold: number,
   files: ReviewPhotoFile[],
   manualFaceOverrides: Record<string, string | null>,
   previousManualSelections: Record<string, FaceSelection>,
 ): Record<string, FaceSelection> {
+  const thresholdPercentage = recognition.thresholdPercentage;
+  if (!Number.isFinite(thresholdPercentage) || thresholdPercentage < 1 || thresholdPercentage > 100) {
+    throw new Error('Recognition response has an invalid threshold.');
+  }
+  const threshold = thresholdPercentage / 100;
   const selections: Record<string, FaceSelection> = {};
 
   for (const [key, selection] of Object.entries(previousManualSelections)) {
@@ -86,7 +91,7 @@ export function eligibleAutoSelections(
         && rosterStudentIds.has(result.studentId)
         && typeof score === 'number'
         && Number.isFinite(score)
-        && score > threshold
+        && score >= threshold
         && !hasConflict
       ) {
         selections[key] = { studentId: result.studentId, source: 'AI' };

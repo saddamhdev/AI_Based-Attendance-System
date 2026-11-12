@@ -35,7 +35,6 @@ ALLOWED_CONTENT_TYPES = {
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
 
 DETECTION_THRESHOLD = 0.70
-MATCH_THRESHOLD = 0.40
 AMBIGUITY_MARGIN = 0.05
 MIN_FACE_SIZE = 30
 
@@ -125,6 +124,7 @@ def calculate_similarity(
 def find_best_student(
     face_embedding,
     student_embeddings,
+    threshold,
 ):
     scores = []
 
@@ -171,13 +171,13 @@ def find_best_student(
     )
 
     if (
-        best_match["score"] >= MATCH_THRESHOLD
+        best_match["score"] >= threshold
         and score_difference >= AMBIGUITY_MARGIN
     ):
         status = "MATCHED"
         student_id = best_match["studentId"]
 
-    elif best_match["score"] >= MATCH_THRESHOLD:
+    elif best_match["score"] >= threshold:
         status = "UNCERTAIN"
         student_id = best_match["studentId"]
 
@@ -236,5 +236,4 @@ def remove_duplicate_student_matches(results):
 
 DETECTOR_MODEL=Path(os.getenv("MODEL_DIR","/app/models"))/"face_detection_yunet_2023mar.onnx"
 RECOGNIZER_MODEL=Path(os.getenv("MODEL_DIR","/app/models"))/"face_recognition_sface_2021dec.onnx"
-MATCH_THRESHOLD=float(os.getenv("MATCH_THRESHOLD","0.40"))
 AMBIGUITY_MARGIN=float(os.getenv("AMBIGUITY_MARGIN","0.05"))

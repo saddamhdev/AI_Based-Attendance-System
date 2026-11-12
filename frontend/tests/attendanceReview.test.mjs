@@ -33,29 +33,42 @@ const makeDetection = (faceId, studentId, score, status = 'MATCHED', extras = {}
   ...extras,
 });
 const select = (photos, overrides = {}, previous = {}, files = [file, file, file]) => eligibleAutoSelections(
-  { photos },
+  { photos, thresholdPercentage: 70 },
   sessionId,
   rosterIds,
-  0.70,
   files,
   overrides,
   previous,
 );
 
-test('uses a strict threshold and finite MATCHED roster IDs only', () => {
+test('uses an inclusive threshold and finite MATCHED roster IDs only', () => {
   const selections = select([makePhoto('photo-a', [
     makeDetection('face-1', 'student-a', 0.70),
     makeDetection('face-2', 'student-b', 0.70001),
-    makeDetection('face-3', 'student-a', Number.NaN),
+    makeDetection('face-3', 'outside-roster', Number.NaN),
     makeDetection('face-4', 'outside-roster', 0.99),
-    makeDetection('face-5', 'student-a', 0.99, 'UNCERTAIN'),
-    makeDetection('face-6', 'student-a', 0.99, 'DUPLICATE'),
-    makeDetection('face-7', 'student-a', 0.99, 'UNKNOWN'),
-    makeDetection('face-8', 'student-a', 0.99, 'LOW_QUALITY'),
-    makeDetection('face-9', 'student-a', 0.99, 'PROCESSING_FAILED'),
+    makeDetection('face-5', 'outside-roster', 0.99, 'UNCERTAIN'),
+    makeDetection('face-6', 'outside-roster', 0.99, 'DUPLICATE'),
+    makeDetection('face-7', 'outside-roster', 0.99, 'UNKNOWN'),
+    makeDetection('face-8', 'outside-roster', 0.99, 'LOW_QUALITY'),
+    makeDetection('face-9', 'outside-roster', 0.99, 'PROCESSING_FAILED'),
   ])]);
-  assert.equal(Object.keys(selections).length, 1);
+  assert.equal(Object.keys(selections).length, 2);
+  assert.equal(selections[detectionKey(sessionId, 'photo-a', 'face-1')].studentId, 'student-a');
   assert.equal(selections[detectionKey(sessionId, 'photo-a', 'face-2')].studentId, 'student-b');
+});
+
+test('uses raw scores before display rounding and rejects invalid response thresholds', () => {
+  const response = {
+    thresholdPercentage: 70.005,
+    photos: [makePhoto('photo-a', [makeDetection('face-1', 'student-a', 0.70004)])],
+  };
+  assert.equal(formatSimilarity(response.photos[0].results[0].score), 'Similarity 70.00%');
+  assert.equal(Object.keys(eligibleAutoSelections(response, sessionId, rosterIds, [file], {}, {})).length, 0);
+  assert.throws(
+    () => eligibleAutoSelections({ ...response, thresholdPercentage: Number.NaN }, sessionId, rosterIds, [file], {}, {}),
+    /invalid threshold/i,
+  );
 });
 
 test('blocks explicit ambiguity and duplicate same-photo identity conflicts', () => {

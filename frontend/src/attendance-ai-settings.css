@@ -1,0 +1,31 @@
+.ai-settings > label {
+  max-width: 700px;
+}
+
+.threshold-controls {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) 110px auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.threshold-controls input[type="range"] {
+  width: 100%;
+  padding: 10px 0;
+  accent-color: #5046df;
+}
+
+.threshold-controls input[type="number"] {
+  width: 100%;
+}
+
+.threshold-saved {
+  font-size: 13px;
+}
+
+@media (max-width: 520px) {
+  .threshold-controls {
+    grid-template-columns: 1fr 85px auto;
+    gap: 8px;
+  }
+}

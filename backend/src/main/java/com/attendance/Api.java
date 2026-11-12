@@ -1,8 +1,12 @@
 package com.attendance;
 import java.util.*;import java.time.LocalDate;import java.time.LocalTime;import java.time.Duration;import java.nio.charset.StandardCharsets;import java.nio.file.*;import javax.imageio.ImageIO;import javax.imageio.stream.ImageInputStream;import java.awt.image.BufferedImage;import java.io.ByteArrayInputStream;import java.io.ByteArrayOutputStream;
 import org.springframework.web.bind.annotation.*;import org.springframework.web.multipart.MultipartFile;import org.springframework.web.server.ResponseStatusException;import org.springframework.http.*;import org.springframework.jdbc.core.JdbcTemplate;import org.springframework.transaction.annotation.Transactional;import org.springframework.security.core.Authentication;import org.springframework.util.LinkedMultiValueMap;import org.springframework.core.io.ByteArrayResource;import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientResponseException;
+import org.springframework.web.client.ResourceAccessException;
+import org.springframework.dao.DataAccessException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 @RestController @RequestMapping("/api") public class Api {
- final JdbcTemplate db; final StudentConsentService consentService; final Path photoRoot=Paths.get(System.getenv().getOrDefault("ENROLLMENT_PHOTO_DIR","./data/enrollment-photos")); Api(JdbcTemplate db,StudentConsentService consentService){this.db=db;this.consentService=consentService;}
+ final JdbcTemplate db; final StudentConsentService consentService; final RecognitionSettingsService recognitionSettings; final ObjectMapper objectMapper; final Path photoRoot=Paths.get(System.getenv().getOrDefault("ENROLLMENT_PHOTO_DIR","./data/enrollment-photos")); Api(JdbcTemplate db,StudentConsentService consentService,RecognitionSettingsService recognitionSettings,ObjectMapper objectMapper){this.db=db;this.consentService=consentService;this.recognitionSettings=recognitionSettings;this.objectMapper=objectMapper;}
  static final java.util.logging.Logger LOG=java.util.logging.Logger.getLogger(Api.class.getName());
  void check(boolean b,String m){if(!b)throw new ResponseStatusException(HttpStatus.CONFLICT,m);}
  boolean admin(Authentication a){return a.getAuthorities().stream().anyMatch(x->x.getAuthority().equals("ROLE_ADMIN"));}
@@ -41,30 +45,116 @@ import org.springframework.web.bind.annotation.*;import org.springframework.web.
  @Transactional @PostMapping("/courses/{id}/archive") Object archiveCourse(@PathVariable UUID id,Authentication a){adminOnly(a);db.queryForMap("select * from courses where id=? for update",id);db.update("update courses set archived=true where id=?",id);adminDeletion("COURSE",id,a,"ARCHIVED");return Map.of("archived",true);}
  @GetMapping("/courses/{id}/students") Object roster(@PathVariable UUID id,Authentication a){course(id,a);return db.queryForList("select s.* from students s join offering_enrollments e on e.student_id=s.id join course_offerings o on o.id=e.offering_id where o.course_id=? and o.legacy and e.status='ACTIVE' order by s.roll",id);}
  @Transactional @PostMapping("/courses/{id}/students/{student}") void enroll(@PathVariable UUID id,@PathVariable UUID student,Authentication a){adminOnly(a);check(db.queryForObject("select count(*) from courses where id=? and archived=false",Integer.class,id)==1,"Course not found or archived");check(db.queryForObject("select count(*) from students where id=? and archived=false",Integer.class,student)==1,"Student not found or archived");var legacy=db.queryForList("select id from course_offerings where course_id=? and legacy=true",UUID.class,id);check(!legacy.isEmpty(),"Legacy offering not found");db.update("insert into offering_enrollments(id,offering_id,student_id,status,active_from,source,created_by) values(?,?,?,'ACTIVE',?,'ADMIN',?) on conflict do nothing",UUID.randomUUID(),legacy.get(0),student,java.time.LocalDate.now(java.time.ZoneId.of("Asia/Dhaka")),a.getName());db.update("insert into offering_enrollment_audit(offering_id,student_id,actor,action) values(?,?,?,'ENROLLED') on conflict do nothing",legacy.get(0),student,a.getName());db.update("insert into enrollments values(?,?) on conflict do nothing",id,student);}
- @PostMapping("/students/{id}/faces") @Transactional Object faces(@PathVariable UUID id,@RequestParam("images") List<MultipartFile> files,Authentication a)throws Exception{
-  adminOnly(a);check(Boolean.TRUE.equals(db.queryForObject("select consent from students where id=? and archived=false",Boolean.class,id)),"Verified consent is required");
-  check(files.size()>=5&&files.size()<=10,"Require 5–10 photos");
-  check(db.queryForObject("select count(*) from student_enrollments where student_id=? and status='PENDING_REVIEW'",Integer.class,id)==0,"Review or cancel the pending student photo submission first");
-  UUID enrollment=UUID.randomUUID();var body=new LinkedMultiValueMap<String,Object>();for(var f:files){validateImage(f);body.add("images",resource(f));}
+ @PostMapping("/students/{id}/faces") @Transactional Object faces(@PathVariable UUID id,
+   @RequestParam("images") List<MultipartFile> files,@RequestParam(defaultValue="") String submissionId,
+   @RequestParam(defaultValue="false") boolean consent,Authentication a){
+  adminOnly(a);
+  var student=db.queryForList("select name,roll,consent from students where id=? and archived=false for update",id);
+  if(student.isEmpty())throw FacePhotoUploadException.known(HttpStatus.NOT_FOUND,"STUDENT_NOT_FOUND",
+    "The selected student is no longer available.",id.toString(),false);
+  var row=student.get(0);String label=row.get("name")+" ("+row.get("roll")+")";
+  UUID previousEnrollment=db.query("select id from student_enrollments where student_id=? and status='ACTIVE'",
+    rs->rs.next()?rs.getObject(1,UUID.class):null,id);
+  boolean previous=previousEnrollment!=null;
+  if(!Boolean.TRUE.equals(row.get("consent"))||!consent)throw FacePhotoUploadException.known(
+    HttpStatus.FORBIDDEN,"CONSENT_OR_IDENTITY_REQUIRED",
+    "Verify the student’s identity and confirm recorded consent before submitting photos.",label,previous);
+  if(files.size()<5||files.size()>10)throw FacePhotoUploadException.known(
+    HttpStatus.BAD_REQUEST,"PHOTO_COUNT_INVALID","Select between 5 and 10 photos.",label,previous);
+  if(db.queryForObject("select count(*) from student_enrollments where student_id=? and status='PENDING_REVIEW'",Integer.class,id)>0)
+    throw FacePhotoUploadException.known(HttpStatus.CONFLICT,"PENDING_SUBMISSION_EXISTS",
+      "Review or cancel the pending student photo submission first.",label,previous);
+  UUID enrollment=parseSubmissionId(submissionId,label,previous);String stage="AI_PROCESSING";
   try{
-   ai().post().uri(u->u.path("/enroll/"+id).queryParam("version",enrollment).build()).contentType(MediaType.MULTIPART_FORM_DATA).body(body).retrieve().toBodilessEntity();
-   Files.createDirectories(photoRoot.resolve(enrollment.toString()));List<StoredPhoto>stored=new ArrayList<>();for(int i=0;i<files.size();i++)stored.add(storePhoto(enrollment,i,files.get(i)));
-   db.update("update student_enrollments set status='RETIRED',retention_until=now()+interval '90 days',embedding_cleanup_pending=true where student_id=? and status='ACTIVE'",id);
-   db.update("insert into student_enrollments(id,student_id,status,accepted_photo_count,created_by,activated_at,submission_source,reviewed_by,reviewed_at) values(?,?,'ACTIVE',?,?,now(),'ADMIN',?,now())",enrollment,id,files.size(),a.getName(),a.getName());
-   for(var photo:stored)db.update("insert into enrollment_photos(id,enrollment_id,storage_key,thumbnail_key,photo_index,width,height) values(?,?,?,?,?,?,?)",photo.id(),enrollment,photo.key(),photo.thumb(),photo.index(),photo.width(),photo.height());
+   var body=new LinkedMultiValueMap<String,Object>();for(var f:files)body.add("images",resource(f));
+   ai().post().uri(u->u.path("/enroll/"+id).queryParam("version",enrollment).build())
+     .contentType(MediaType.MULTIPART_FORM_DATA).body(body).retrieve().toBodilessEntity();
+   stage="PHOTO_STORAGE";
+   Files.createDirectories(photoRoot.resolve(enrollment.toString()));
+   List<StoredPhoto>stored=new ArrayList<>();
+   for(int i=0;i<files.size();i++)stored.add(storePhoto(enrollment,i,files.get(i)));
+   stage="DATABASE_SAVE";
+   db.update("insert into student_enrollments(id,student_id,status,accepted_photo_count,created_by,submission_source) values(?,?,'ACTIVE',?,?,'ADMIN')",
+     enrollment,id,files.size(),a.getName());
+   for(var photo:stored)db.update("insert into enrollment_photos(id,enrollment_id,storage_key,thumbnail_key,photo_index,width,height) values(?,?,?,?,?,?,?)",
+     photo.id(),enrollment,photo.key(),photo.thumb(),photo.index(),photo.width(),photo.height());
+   stage="ACTIVATION";
+   db.update("update student_enrollments set status='RETIRED',retention_until=now()+interval '90 days',embedding_cleanup_pending=true where student_id=? and status='ACTIVE' and id<>?",
+     id,enrollment);
    ai().post().uri(u->u.path("/enroll/"+id+"/activate").queryParam("version",enrollment).build()).retrieve().toBodilessEntity();
-   db.update("insert into student_photo_submission_audit(enrollment_id,student_id,actor,action,reason) values(?,?,?,'APPROVED','Admin verified identity and recorded consent')",enrollment,id,a.getName());
-   return Map.of("enrollmentId",enrollment,"acceptedPhotoCount",files.size(),"status","ACTIVE");
-  }catch(Exception exception){
-   try{ai().delete().uri(u->u.path("/enroll/"+id).queryParam("version",enrollment).build()).retrieve().toBodilessEntity();}
-   catch(Exception cleanup){LOG.severe("Failed to clean staged admin embedding "+enrollment+": "+cleanup.getMessage());}
-   deleteEnrollmentFiles(enrollment);throw exception;
+   db.update("update student_enrollments set activated_at=now(),reviewed_by=?,reviewed_at=now() where id=?",a.getName(),enrollment);
+   db.update("insert into student_photo_submission_audit(enrollment_id,student_id,actor,action,reason) values(?,?,?,'APPROVED','Admin verified identity and recorded consent')",
+     enrollment,id,a.getName());
+   return Map.of("enrollmentId",enrollment,"submissionId",enrollment,"studentId",id,
+     "acceptedPhotoCount",files.size(),"status","ACTIVE");
+  }catch(Exception failure){
+   boolean preserved=previous;
+   if(previous&&"ACTIVATION".equals(stage))preserved=restoreEmbedding(id,previousEnrollment);
+   cleanupStagedEnrollment(id,enrollment);
+   throw faceUploadFailure(failure,stage,label,previous,preserved);
   }
  }
  record StoredPhoto(UUID id,String key,String thumb,int index,int width,int height){}
+ UUID parseSubmissionId(String value,String label,boolean previous){
+  if(value==null||value.isBlank())return UUID.randomUUID();
+  try{return UUID.fromString(value);}
+  catch(IllegalArgumentException invalid){throw FacePhotoUploadException.known(HttpStatus.BAD_REQUEST,
+    "INVALID_SUBMISSION_ID","Start a new photo submission and retry.",label,previous);}
+ }
+ boolean restoreEmbedding(UUID student,UUID previousEnrollment){
+  if(previousEnrollment==null)return true;
+  try{
+   ai().post().uri(u->u.path("/enroll/"+student+"/activate")
+     .queryParam("version",previousEnrollment).build()).retrieve().toBodilessEntity();
+   return true;
+  }catch(Exception failure){
+   LOG.warning("Unable to confirm restoration of the previous active face enrollment "+previousEnrollment);
+   return false;
+  }
+ }
+ void cleanupStagedEnrollment(UUID student,UUID enrollment){
+  try{ai().delete().uri(u->u.path("/enroll/"+student).queryParam("version",enrollment).build())
+    .retrieve().toBodilessEntity();}
+  catch(Exception cleanup){LOG.warning("Staged face-template cleanup requires follow-up for "+enrollment);}
+  try{deleteEnrollmentFiles(enrollment);}
+  catch(Exception cleanup){LOG.warning("Staged face-photo cleanup requires follow-up for "+enrollment);}
+ }
+ FacePhotoUploadException faceUploadFailure(Exception failure,String stage,String label,
+   boolean hadPreviousEnrollment,boolean previousPreserved){
+  if(failure instanceof FacePhotoUploadException uploadFailure)return uploadFailure;
+  if(failure instanceof RestClientResponseException responseFailure){
+   try{
+    var root=objectMapper.readTree(responseFailure.getResponseBodyAsByteArray());
+    var detail=root.path("detail");
+    if(detail.isMissingNode())detail=root;
+    var errors=new ArrayList<FacePhotoError>();
+    for(var item:detail.path("photoErrors")){
+     errors.add(new FacePhotoError(item.path("photoIndex").asInt(),
+       item.path("code").asText("PHOTO_PROCESSING_FAILED"),
+       item.path("message").asText("could not be processed.")));
+    }
+    if(!errors.isEmpty())return FacePhotoUploadException.validation(
+      detail.path("code").asText("FACE_PHOTO_VALIDATION_FAILED"),
+      "Some photos need to be replaced.",label,errors,previousPreserved);
+   }catch(Exception invalidResponse){LOG.warning("Face processing returned an unreadable error response.");}
+   return FacePhotoUploadException.unexpected("AI_PROCESSING_FAILED",
+     "Face processing could not be completed. Check the service and retry.",label,previousPreserved);
+  }
+  if(failure instanceof ResourceAccessException)return FacePhotoUploadException.unexpected(
+    "AI_TIMEOUT_OR_UNAVAILABLE","Face processing timed out or is unavailable. Check the service and retry.",
+    label,previousPreserved);
+  if(failure instanceof DataAccessException)return FacePhotoUploadException.unexpected(
+    "DATABASE_SAVE_FAILED","Submission details could not be saved. Retry the upload.",label,previousPreserved);
+  if("PHOTO_STORAGE".equals(stage))return FacePhotoUploadException.unexpected(
+    "PHOTO_STORAGE_FAILED","Photos could not be stored securely. Retry the upload.",label,previousPreserved);
+  if("ACTIVATION".equals(stage))return FacePhotoUploadException.unexpected(
+    "ENROLLMENT_ACTIVATION_FAILED","The new embedding could not be activated. Retry after checking the AI service.",
+    label,previousPreserved);
+  return FacePhotoUploadException.unexpected("PHOTO_SUBMISSION_FAILED",
+    "The photo submission could not be completed. Retry the upload.",label,previousPreserved);
+ }
  void deleteStoredPhotos(UUID student)throws Exception{for(var p:db.queryForList("select storage_key,thumbnail_key from enrollment_photos p join student_enrollments e on e.id=p.enrollment_id where e.student_id=?",student)){Files.deleteIfExists(photoRoot.resolve((String)p.get("storage_key")));Files.deleteIfExists(photoRoot.resolve((String)p.get("thumbnail_key")));}}
- void deleteEnrollmentFiles(UUID enrollment)throws Exception{if(Files.exists(photoRoot.resolve(enrollment.toString())))try(var paths=Files.walk(photoRoot.resolve(enrollment.toString()))){paths.sorted(Comparator.reverseOrder()).forEach(p->{try{Files.deleteIfExists(p);}catch(Exception ignored){}});}}
- void validateImage(MultipartFile f)throws Exception{check(f.getSize()>0&&f.getSize()<=10485760,"Image must be 1–10 MB");byte[] bytes=f.getBytes();try(ImageInputStream stream=ImageIO.createImageInputStream(new ByteArrayInputStream(bytes))){Iterator<javax.imageio.ImageReader> readers=ImageIO.getImageReaders(stream);check(readers.hasNext(),"Use a valid JPEG or PNG image");var reader=readers.next();try{String format=reader.getFormatName();check(format.equalsIgnoreCase("JPEG")||format.equalsIgnoreCase("PNG"),"Use a JPEG or PNG image");reader.setInput(stream);long pixels=(long)reader.getWidth(0)*reader.getHeight(0);check(pixels<=24000000,"Image dimensions must not exceed 24 megapixels");BufferedImage im=reader.read(0);check(im!=null&&im.getWidth()>=30&&im.getHeight()>=30,"Image is too small");}finally{reader.dispose();}}}
+ void deleteEnrollmentFiles(UUID enrollment)throws Exception{Path directory=photoRoot.resolve(enrollment.toString());if(Files.exists(directory))try(var paths=Files.walk(directory)){for(Path path:paths.sorted(Comparator.reverseOrder()).toList())Files.deleteIfExists(path);}}
  StoredPhoto storePhoto(UUID enrollment,int index,MultipartFile file)throws Exception{BufferedImage im=ImageIO.read(new ByteArrayInputStream(file.getBytes()));UUID id=UUID.randomUUID();String key=enrollment+"/"+id+".jpg",thumb=enrollment+"/"+id+"-thumb.jpg";Path full=photoRoot.resolve(key),small=photoRoot.resolve(thumb);Files.createDirectories(full.getParent());ImageIO.write(im,"jpg",full.toFile());BufferedImage t=new BufferedImage(Math.min(320,im.getWidth()),Math.max(1,Math.min(320,im.getWidth())*im.getHeight()/im.getWidth()),BufferedImage.TYPE_INT_RGB);var g=t.createGraphics();g.drawImage(im,0,0,t.getWidth(),t.getHeight(),null);g.dispose();ImageIO.write(t,"jpg",small.toFile());return new StoredPhoto(id,key,thumb,index,im.getWidth(),im.getHeight());}
  @GetMapping("/students/{id}/faces") Object facePhotos(@PathVariable UUID id,@RequestParam UUID enrollmentId,Authentication a){adminOnly(a);return db.queryForList("select p.id,p.enrollment_id,p.photo_index,p.width,p.height from enrollment_photos p join student_enrollments e on e.id=p.enrollment_id where e.student_id=? and e.id=? and e.status='ACTIVE' order by p.photo_index",id,enrollmentId);}
  @GetMapping("/students/{student}/faces/{photo}") ResponseEntity<byte[]> face(@PathVariable UUID student,@PathVariable UUID photo,@RequestParam UUID enrollmentId,Authentication a)throws Exception{return image(student,enrollmentId,photo,false,a);}
@@ -72,22 +162,45 @@ import org.springframework.web.bind.annotation.*;import org.springframework.web.
  ResponseEntity<byte[]> image(UUID student,UUID enrollmentId,UUID photo,boolean thumbnail,Authentication a)throws Exception{adminOnly(a);var keys=db.queryForList("select p."+(thumbnail?"thumbnail_key":"storage_key")+" from enrollment_photos p join student_enrollments e on e.id=p.enrollment_id where p.id=? and e.id=? and e.student_id=? and e.status='ACTIVE'",String.class,photo,enrollmentId,student);if(keys.isEmpty())throw new ResponseStatusException(HttpStatus.NOT_FOUND,"Enrollment photo not found");return ResponseEntity.ok().cacheControl(org.springframework.http.CacheControl.noStore()).contentType(MediaType.IMAGE_JPEG).body(Files.readAllBytes(photoRoot.resolve(keys.get(0))));}
  @DeleteMapping("/students/{id}/faces") @Transactional void deleteFaces(@PathVariable UUID id,Authentication a)throws Exception{adminOnly(a);ai().delete().uri("/enroll/"+id).retrieve().toBodilessEntity();deleteStoredPhotos(id);db.update("delete from enrollment_photos where enrollment_id in (select id from student_enrollments where student_id=?)",id);db.update("delete from student_enrollments where student_id=?",id);db.update("update students set consent=false where id=?",id);}
  UUID activeStudentId(Authentication authentication){return db.query("select a.student_id from student_accounts a join students s on s.id=a.student_id where lower(a.username)=lower(?) and a.active=true and a.account_status='APPROVED' and s.archived=false",rs->rs.next()?rs.getObject(1,UUID.class):null,authentication.getName());}
- @PostMapping("/student/faces") @Transactional Object studentFaceSubmission(@RequestParam("images")List<MultipartFile>files,@RequestParam boolean consent,Authentication a)throws Exception{
-  UUID student=activeStudentId(a);if(student==null)throw new ResponseStatusException(HttpStatus.FORBIDDEN,"An active approved student account is required");
-  db.queryForMap("select id from students where id=? and archived=false for update",student);
-  check(consent,"Explicit biometric consent is required to submit face photos");check(files.size()>=5&&files.size()<=10,"Require 5–10 photos");
-  if(db.queryForObject("select count(*) from student_enrollments where student_id=? and status='PENDING_REVIEW'",Integer.class,student)>0)throw new ResponseStatusException(HttpStatus.CONFLICT,"A face-photo submission is already pending review");
-  for(var file:files)validateImage(file);
-  UUID enrollment=UUID.randomUUID();var body=new LinkedMultiValueMap<String,Object>();for(var file:files)body.add("images",resource(file));
-  db.update("update students set consent=true,consent_updated_at=now(),consent_source='STUDENT' where id=? and archived=false",student);
+ @PostMapping("/student/faces") @Transactional Object studentFaceSubmission(
+   @RequestParam("images")List<MultipartFile>files,@RequestParam boolean consent,
+   @RequestParam(defaultValue="") String submissionId,Authentication a){
+  UUID student=activeStudentId(a);if(student==null)throw new ResponseStatusException(HttpStatus.FORBIDDEN,
+    "An active approved student account is required");
+  var profile=db.queryForMap("select id,name,roll,consent from students where id=? and archived=false for update",student);
+  String label=profile.get("name")+" ("+profile.get("roll")+")";
+  boolean previous=Boolean.TRUE.equals(db.queryForObject(
+    "select count(*)>0 from student_enrollments where student_id=? and status='ACTIVE'",Boolean.class,student));
+  if(!consent)throw FacePhotoUploadException.known(HttpStatus.BAD_REQUEST,"CONSENT_REQUIRED",
+    "Give explicit biometric consent before submitting photos.",label,previous);
+  if(files.size()<5||files.size()>10)throw FacePhotoUploadException.known(HttpStatus.BAD_REQUEST,
+    "PHOTO_COUNT_INVALID","Select between 5 and 10 photos.",label,previous);
+  if(db.queryForObject("select count(*) from student_enrollments where student_id=? and status='PENDING_REVIEW'",Integer.class,student)>0)
+    throw FacePhotoUploadException.known(HttpStatus.CONFLICT,"PENDING_SUBMISSION_EXISTS",
+      "A face-photo submission is already pending review.",label,previous);
+  UUID enrollment=parseSubmissionId(submissionId,label,previous);String stage="AI_PROCESSING";
   try{
-   ai().post().uri(u->u.path("/enroll/"+student).queryParam("version",enrollment).build()).contentType(MediaType.MULTIPART_FORM_DATA).body(body).retrieve().toBodilessEntity();
-   Files.createDirectories(photoRoot.resolve(enrollment.toString()));List<StoredPhoto>stored=new ArrayList<>();for(int i=0;i<files.size();i++)stored.add(storePhoto(enrollment,i,files.get(i)));
-   db.update("insert into student_enrollments(id,student_id,status,accepted_photo_count,created_by,submission_source) values(?,?,'PENDING_REVIEW',?,?,'SELF_REGISTRATION')",enrollment,student,files.size(),a.getName());
-   for(var photo:stored)db.update("insert into enrollment_photos(id,enrollment_id,storage_key,thumbnail_key,photo_index,width,height) values(?,?,?,?,?,?,?)",photo.id(),enrollment,photo.key(),photo.thumb(),photo.index(),photo.width(),photo.height());
-   db.update("insert into student_photo_submission_audit(enrollment_id,student_id,actor,action) values(?,?,?,'SUBMITTED')",enrollment,student,a.getName());
-   return Map.of("enrollmentId",enrollment,"status","PENDING_REVIEW","acceptedPhotoCount",files.size());
-  }catch(Exception exception){try{ai().delete().uri(u->u.path("/enroll/"+student).queryParam("version",enrollment).build()).retrieve().toBodilessEntity();}catch(Exception cleanup){LOG.severe("Failed to remove staged embedding "+enrollment+": "+cleanup.getMessage());}deleteEnrollmentFiles(enrollment);throw exception;}
+   var body=new LinkedMultiValueMap<String,Object>();for(var file:files)body.add("images",resource(file));
+   ai().post().uri(u->u.path("/enroll/"+student).queryParam("version",enrollment).build())
+     .contentType(MediaType.MULTIPART_FORM_DATA).body(body).retrieve().toBodilessEntity();
+   stage="PHOTO_STORAGE";
+   Files.createDirectories(photoRoot.resolve(enrollment.toString()));
+   List<StoredPhoto>stored=new ArrayList<>();
+   for(int i=0;i<files.size();i++)stored.add(storePhoto(enrollment,i,files.get(i)));
+   stage="DATABASE_SAVE";
+   db.update("update students set consent=true,consent_updated_at=now(),consent_source='STUDENT' where id=? and archived=false",student);
+   db.update("insert into student_enrollments(id,student_id,status,accepted_photo_count,created_by,submission_source) values(?,?,'PENDING_REVIEW',?,?,'SELF_REGISTRATION')",
+     enrollment,student,files.size(),a.getName());
+   for(var photo:stored)db.update("insert into enrollment_photos(id,enrollment_id,storage_key,thumbnail_key,photo_index,width,height) values(?,?,?,?,?,?,?)",
+     photo.id(),enrollment,photo.key(),photo.thumb(),photo.index(),photo.width(),photo.height());
+   db.update("insert into student_photo_submission_audit(enrollment_id,student_id,actor,action) values(?,?,?,'SUBMITTED')",
+     enrollment,student,a.getName());
+   return Map.of("enrollmentId",enrollment,"submissionId",enrollment,"studentId",student,
+     "status","PENDING_REVIEW","acceptedPhotoCount",files.size());
+  }catch(Exception failure){
+   cleanupStagedEnrollment(student,enrollment);
+   throw faceUploadFailure(failure,stage,label,previous,previous);
+  }
  }
  @GetMapping("/student/faces") Object studentFaceSubmissions(Authentication a){UUID student=activeStudentId(a);if(student==null)throw new ResponseStatusException(HttpStatus.FORBIDDEN,"An active approved student account is required");return db.queryForList("select id,status,accepted_photo_count,rejection_reason,created_at,reviewed_at,retention_until from student_enrollments where student_id=? and status in ('ACTIVE','PENDING_REVIEW','REJECTED','CANCELLED') order by created_at desc",student);}
  @GetMapping("/student/faces/{enrollment}/photos") Object studentFacePhotoList(@PathVariable UUID enrollment,Authentication a){UUID student=activeStudentId(a);if(student==null)throw new ResponseStatusException(HttpStatus.FORBIDDEN);return db.queryForList("select p.id,p.enrollment_id,p.photo_index,p.width,p.height from enrollment_photos p join student_enrollments e on e.id=p.enrollment_id where e.student_id=? and e.id=? and e.status in ('ACTIVE','PENDING_REVIEW') order by p.photo_index",student,enrollment);}
@@ -174,15 +287,15 @@ import org.springframework.web.bind.annotation.*;import org.springframework.web.
   boolean overlap=db.queryForObject("select count(*)>0 from sessions where id<>? and offering_id=? and teacher_profile_id=? and class_date=? and class_start_time<? and class_end_time>?",Boolean.class,id,offeringId,actualTeacher,x.date(),x.endTime(),x.startTime());
   return Map.of("id",id,"overlapWarning",overlap);
  }
- @GetMapping("/sessions/{id}") @Transactional Object get(@PathVariable UUID id,Authentication a){var s=session(id,a);return Map.of("session",s,"roster",db.queryForList("select * from attendance where session_id=? order by roll",id),"audit",db.queryForList("select * from audit where session_id=? order by id",id));}
+ @GetMapping("/sessions/{id}") @Transactional Object get(@PathVariable UUID id,Authentication a){var s=session(id,a);var result=new LinkedHashMap<String,Object>();result.put("session",s);result.put("roster",db.queryForList("select * from attendance where session_id=? order by roll",id));result.put("audit",db.queryForList("select * from audit where session_id=? order by id",id));result.put("recognitionAnalysis",recognitionSettings.latestAnalysis(id));return result;}
  @Transactional @DeleteMapping("/sessions/{id}") Object deleteSession(@PathVariable UUID id,Authentication a){adminOnly(a);var s=db.queryForMap("select * from sessions where id=? for update",id);check(!"FINALIZED".equals(s.get("status")),"Finalized sessions cannot be deleted.");db.update("delete from attendance where session_id=?",id);db.update("delete from session_substitute_authorizations where session_id=?",id);db.update("delete from audit where session_id=?",id);adminDeletion("SESSION",id,a,"DELETED");db.update("delete from sessions where id=?",id);return Map.of("deleted",true);}
  record Edit(int version,Map<UUID,String> states,Map<UUID,String> sources){}
  @Transactional @DeleteMapping("/sessions/{id}/substitute/{teacherId}") Object revokeSubstitute(@PathVariable UUID id,@PathVariable UUID teacherId,Authentication a){adminOnly(a);var s=db.queryForMap("select id,status from sessions where id=? for update",id);draft(s);int updated=db.update("update session_substitute_authorizations set revoked_at=now() where session_id=? and teacher_id=? and revoked_at is null",id,teacherId);check(updated==1,"Active substitute authorization not found");audit(id,a,"SUBSTITUTE_REVOKED "+teacherId);return Map.of("revoked",true);}
  @PutMapping("/sessions/{id}") @Transactional Object save(@PathVariable UUID id,@RequestBody Edit x,Authentication a){var s=session(id,a);draft(s);check(((Number)s.get("version")).intValue()==x.version(),"Draft changed. Reload before saving.");for(var e:x.states().entrySet()){check(Set.of("PRESENT","ABSENT","UNCONFIRMED").contains(e.getValue()),"Invalid state");String source=x.sources()==null?"MANUAL":x.sources().getOrDefault(e.getKey(),"MANUAL");check(Set.of("NONE","AI","MANUAL").contains(source),"Invalid decision source");check(db.update("update attendance set state=?,decision_source=? where session_id=? and student_id=?",e.getValue(),source,id,e.getKey())==1,"Student outside roster");}db.update("update sessions set version=version+1,status='IN_REVIEW' where id=?",id);audit(id,a,"DRAFT_SAVED "+x.states());return get(id,a);}
  @PostMapping("/sessions/{id}/confirm") @Transactional Object confirm(@PathVariable UUID id,@RequestBody Map<String,Integer> x,Authentication a){var s=session(id,a);if(s.get("status").equals("FINALIZED"))return get(id,a);check(Objects.equals(s.get("version"),x.get("version")),"Draft changed. Reload.");check(db.queryForObject("select count(*) from attendance where session_id=?",Integer.class,id)>0,"Empty roster");check(db.queryForObject("select count(*) from attendance where session_id=? and state='UNCONFIRMED'",Integer.class,id)==0,"Review every student first");db.update("update sessions set status='FINALIZED',version=version+1 where id=?",id);audit(id,a,"FINALIZED");return get(id,a);}
- @PostMapping("/sessions/{id}/recognize") @Transactional Object recognize(@PathVariable UUID id,@RequestParam("images") List<MultipartFile> files,Authentication a)throws Exception{var s=session(id,a);draft(s);check(files.size()>=1&&files.size()<=3,"Upload 1–3 photos");var ids=db.queryForList("select a.student_id from attendance a join students s on s.id=a.student_id where a.session_id=? and s.consent=true",UUID.class,id);var body=new LinkedMultiValueMap<String,Object>();body.add("studentIds",String.join(",",ids.stream().map(UUID::toString).toList()));for(var f:files)body.add("images",resource(f));return ai().post().uri("/recognize").contentType(MediaType.MULTIPART_FORM_DATA).body(body).retrieve().body(Map.class);}
+ @PostMapping("/sessions/{id}/recognize") @Transactional Object recognize(@PathVariable UUID id,@RequestParam("images") List<MultipartFile> files,Authentication a)throws Exception{var s=session(id,a);draft(s);check(files.size()>=1&&files.size()<=3,"Upload 1–3 photos");double threshold=recognitionSettings.threshold(a);var ids=db.queryForList("select distinct a.student_id from attendance a join students s on s.id=a.student_id join student_enrollments e on e.student_id=s.id and e.status='ACTIVE' where a.session_id=? and s.consent=true and s.archived=false",UUID.class,id);var body=new LinkedMultiValueMap<String,Object>();body.add("studentIds",String.join(",",ids.stream().map(UUID::toString).toList()));body.add("thresholdPercentage",Double.toString(threshold));for(var f:files)body.add("images",resource(f));Map<String,Object> response=ai().post().uri("/recognize").contentType(MediaType.MULTIPART_FORM_DATA).body(body).retrieve().body(Map.class);if(response==null)throw new IllegalStateException("AI recognition service returned an empty response.");return recognitionSettings.saveAnalysis(id,a,threshold,response);}
  @GetMapping(value="/reports.csv",produces="text/csv") Object report(Authentication a){var rows=admin(a)?db.queryForList("select c.name,a.roll,a.student_name,count(*) total,count(*) filter(where a.state='PRESENT') present from attendance a join sessions s on s.id=a.session_id join courses c on c.id=s.course_id where s.status='FINALIZED' group by c.name,a.roll,a.student_name"):db.queryForList("select c.name,a.roll,a.student_name,count(*) total,count(*) filter(where a.state='PRESENT') present from attendance a join sessions s on s.id=a.session_id join courses c on c.id=s.course_id where s.status='FINALIZED' and c.teacher=? group by c.name,a.roll,a.student_name",a.getName());var out=new StringBuilder("Course,Roll,Name,Finalized sessions,Present,Percentage\n");for(var row:rows){for(String k:List.of("name","roll","student_name","total","present"))out.append(csv(row.get(k))).append(',');out.append(100.0*((Number)row.get("present")).doubleValue()/((Number)row.get("total")).doubleValue()).append('\n');}return out.toString();}
  String csv(Object x){String v=String.valueOf(x);if(v.matches("^[=+@-].*"))v="'"+v;return "\""+v.replace("\"","\"\"")+"\"";}
- ByteArrayResource resource(MultipartFile f)throws Exception{check(f.getSize()>0&&f.getSize()<=10485760,"Invalid image size");return new ByteArrayResource(f.getBytes()){@Override public String getFilename(){return "upload.jpg";}};}
- RestClient ai(){return RestClient.builder().baseUrl(System.getenv().getOrDefault("AI_URL","http://localhost:8001")).defaultHeader("X-Service-Key",System.getenv("AI_SERVICE_KEY")).build();}
+ ByteArrayResource resource(MultipartFile f)throws Exception{return new ByteArrayResource(f.getBytes()){@Override public String getFilename(){return "upload.jpg";}};}
+ RestClient ai(){var factory=new org.springframework.http.client.SimpleClientHttpRequestFactory();factory.setConnectTimeout(java.time.Duration.ofSeconds(3));factory.setReadTimeout(java.time.Duration.ofSeconds(150));return RestClient.builder().requestFactory(factory).baseUrl(System.getenv().getOrDefault("AI_URL","http://localhost:8001")).defaultHeader("X-Service-Key",System.getenv("AI_SERVICE_KEY")).build();}
 }
