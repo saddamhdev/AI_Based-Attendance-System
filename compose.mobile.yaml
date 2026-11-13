@@ -1,0 +1,6 @@
+# Development-only override: publishes the Spring Boot API on all interfaces so a phone on the
+# same network can reach it. Do not use on untrusted networks; use HTTPS in production.
+#   docker compose -f compose.yaml -f compose.mobile.yaml up
+services:
+  backend:
+    ports: ["0.0.0.0:8080:8080"]

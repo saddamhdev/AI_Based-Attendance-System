@@ -142,8 +142,13 @@ def recognize(images:list[UploadFile]=File(...),studentIds:str=Form(default=""),
         else:path=DATA/(id+".npy")
         if path.exists():students[id]=normalize_embedding(np.load(path,allow_pickle=False))
     photos=[];matched=set();blocked=set();recognizer=create_recognizer()
-    for file in images:
-        im=decode(file);h,w=im.shape[:2];results=[];photo_id=str(uuid.uuid4())
+    for photo_number,file in enumerate(images,1):
+        try:im=decode(file)
+        except HTTPException as error:
+            # Identify which classroom photo failed so the client can ask for that one to be replaced.
+            detail=error.detail if isinstance(error.detail,dict) else {"code":"INVALID_IMAGE","message":str(error.detail)}
+            raise HTTPException(error.status_code,detail={**detail,"photoIndex":photo_number}) from error
+        h,w=im.shape[:2];results=[];photo_id=str(uuid.uuid4())
         for index,face in enumerate(detect(im),1):
             x,y,fw,fh=map(int,face[:4]);base={"faceNumber":index,"faceId":photo_id+":"+str(index),"boundingBox":{"x":x,"y":y,"width":fw,"height":fh},"detectionConfidence":float(face[14])}
             if min(fw,fh)<30:result={"status":"LOW_QUALITY","studentId":None}

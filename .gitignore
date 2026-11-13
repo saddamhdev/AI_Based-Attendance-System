@@ -11,3 +11,6 @@ __pycache__/
 *.jpeg
 *.png
 data/
+# App icons/splash images are not biometric data.
+!mobile/assets/
+!mobile/assets/**

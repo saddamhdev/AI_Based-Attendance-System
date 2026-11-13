@@ -3,7 +3,7 @@ package com.attendance;
 import java.util.List;
 import java.util.Map;
 
-import jakarta.servlet.http.HttpServletResponse;
+import jakarta.servlet.DispatcherType;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -13,6 +13,7 @@ import org.springframework.security.core.userdetails.UserDetailsService;
 import org.springframework.security.core.userdetails.UsernameNotFoundException;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.www.BasicAuthenticationFilter;
 import org.springframework.security.authorization.AuthorizationDecision;
 
 @Configuration
@@ -68,43 +69,72 @@ public class Security {
         };
     }
 
+    static boolean hasRole(org.springframework.security.core.Authentication authentication, String role) {
+        return authentication != null && authentication.isAuthenticated()
+                && authentication.getAuthorities().stream()
+                        .anyMatch(authority -> authority.getAuthority().equals("ROLE_" + role));
+    }
+
+    static boolean mustChangePassword(JdbcTemplate db, String username) {
+        return Boolean.TRUE.equals(db.queryForObject(
+                "select count(*)>0 from student_accounts where lower(username)=lower(?) and must_change_password=true",
+                Boolean.class, username));
+    }
+
     @Bean
-    SecurityFilterChain filter(HttpSecurity http, JdbcTemplate db) throws Exception {
+    SecurityFilterChain filter(HttpSecurity http, JdbcTemplate db, ApiTokenService tokens) throws Exception {
         return http
                 .csrf(csrf -> csrf.disable())
+                .addFilterBefore(new BearerTokenFilter(tokens), BasicAuthenticationFilter.class)
                 .authorizeHttpRequests(authorize -> authorize
+                        // Let controller errors reach the client with their real status instead of a
+                        // Forbidden produced by authorizing the container's /error dispatch.
+                        .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
+                        .requestMatchers("/error").permitAll()
+                        .requestMatchers("/api/auth/token").permitAll()
                         .requestMatchers("/api/student-registrations", "/api/student-registrations/status",
                                 "/api/student-registrations/resubmit").permitAll()
-                        .requestMatchers("/api/me", "/api/account/password").authenticated()
+                        .requestMatchers("/api/me").authenticated()
+                        .requestMatchers("/api/applicant/**").hasRole("APPLICANT")
+                        .requestMatchers("/api/account/password").hasAnyRole("ADMIN", "TEACHER", "STUDENT")
                         .requestMatchers("/api/student/**").access((authentication, context) -> {
                             var current = authentication.get();
-                            if (current == null || !current.isAuthenticated()
-                                    || current.getAuthorities().stream()
-                                            .noneMatch(authority -> authority.getAuthority().equals("ROLE_STUDENT"))) {
-                                return new AuthorizationDecision(false);
-                            }
-                            boolean mustChange = db.queryForObject(
-                                    "select count(*)>0 from student_accounts where lower(username)=lower(?) "
-                                            + "and must_change_password=true",
-                                    Boolean.class, current.getName());
-                            return new AuthorizationDecision(!mustChange);
+                            if (!hasRole(current, "STUDENT")) return new AuthorizationDecision(false);
+                            return new AuthorizationDecision(!mustChangePassword(db, current.getName()));
                         })
+                        // Staff endpoints. Previously "any non-student"; now explicit so restricted
+                        // principals such as registration applicants are excluded.
                         .requestMatchers("/api/**").access((authentication, context) -> {
                             var current = authentication.get();
-                            if (current == null || !current.isAuthenticated()
-                                    || current.getAuthorities().stream()
-                                            .anyMatch(authority -> authority.getAuthority().equals("ROLE_STUDENT"))) {
+                            if (!hasRole(current, "ADMIN") && !hasRole(current, "TEACHER")) {
                                 return new AuthorizationDecision(false);
                             }
-                            boolean mustChange = db.queryForObject(
-                                    "select count(*)>0 from student_accounts where lower(username)=lower(?) "
-                                            + "and must_change_password=true",
-                                    Boolean.class, current.getName());
-                            return new AuthorizationDecision(!mustChange);
+                            return new AuthorizationDecision(!mustChangePassword(db, current.getName()));
                         })
                         .anyRequest().denyAll())
                 .httpBasic(basic -> basic.authenticationEntryPoint(
-                        (request, response, exception) -> response.sendError(HttpServletResponse.SC_UNAUTHORIZED)))
+                        (request, response, exception) -> ApiErrors.writeJson(response,
+                                org.springframework.http.HttpStatus.UNAUTHORIZED, "UNAUTHENTICATED",
+                                "Sign in to continue.")))
+                .exceptionHandling(exceptions -> exceptions
+                        .authenticationEntryPoint((request, response, exception) -> ApiErrors.writeJson(response,
+                                org.springframework.http.HttpStatus.UNAUTHORIZED, "UNAUTHENTICATED",
+                                "Sign in to continue."))
+                        .accessDeniedHandler((request, response, exception) -> {
+                            var current = org.springframework.security.core.context.SecurityContextHolder
+                                    .getContext().getAuthentication();
+                            if (hasRole(current, "STUDENT") && mustChangePassword(db, current.getName())) {
+                                ApiErrors.writeJson(response, org.springframework.http.HttpStatus.FORBIDDEN,
+                                        "PASSWORD_CHANGE_REQUIRED", "Change your temporary password to continue.");
+                            } else if (hasRole(current, "APPLICANT")) {
+                                ApiErrors.writeJson(response, org.springframework.http.HttpStatus.FORBIDDEN,
+                                        "REGISTRATION_NOT_APPROVED",
+                                        "Your registration has not been approved yet.");
+                            } else {
+                                ApiErrors.writeJson(response, org.springframework.http.HttpStatus.FORBIDDEN,
+                                        "FORBIDDEN", "You do not have permission to perform this action.");
+                            }
+                        }))
                 .sessionManagement(session -> session.sessionCreationPolicy(
                         org.springframework.security.config.http.SessionCreationPolicy.STATELESS))
                 .build();

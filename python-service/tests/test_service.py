@@ -115,4 +115,13 @@ class ServiceTests(unittest.TestCase):
   results=response.json()['photos'][0]['results']
   self.assertEqual([result['status'] for result in results],['UNCERTAIN','UNCERTAIN'])
   self.assertEqual(response.json()['matchedStudentIds'],[])
+ def test_recognition_error_identifies_classroom_photo_index(self):
+  good=io.BytesIO();Image.new('RGB',(64,64),'white').save(good,'JPEG')
+  with patch.object(service,'models'),patch.object(service,'create_recognizer',return_value=object()),patch.object(service,'detect',return_value=[]):
+   response=self.c.post('/recognize',headers=self.h,data={'thresholdPercentage':'70'},
+    files=[('images',('one.jpg',good.getvalue(),'image/jpeg')),('images',('two.jpg',b'not an image','image/jpeg'))])
+  self.assertEqual(response.status_code,400)
+  detail=response.json()['detail']
+  self.assertEqual(detail['photoIndex'],2)
+  self.assertEqual(detail['code'],'INVALID_IMAGE')
 if __name__=='__main__':unittest.main()

@@ -40,11 +40,13 @@ public class StudentPortal {
 
     private final JdbcTemplate db;
     private final BCryptPasswordEncoder passwordEncoder;
+    private final ApiTokenService tokens;
     private final ConcurrentHashMap<String, RateWindow> rateWindows = new ConcurrentHashMap<>();
 
-    StudentPortal(JdbcTemplate db, BCryptPasswordEncoder passwordEncoder) {
+    StudentPortal(JdbcTemplate db, BCryptPasswordEncoder passwordEncoder, ApiTokenService tokens) {
         this.db = db;
         this.passwordEncoder = passwordEncoder;
+        this.tokens = tokens;
     }
 
     private record RateWindow(long startMillis, int requests) {}
@@ -233,6 +235,91 @@ public class StudentPortal {
         }
         return Map.of("reference", request.reference(), "status", "PENDING_APPROVAL");
     }
+
+    private ApplicantPrincipal applicant(Authentication authentication) {
+        if (authentication != null && authentication.getPrincipal() instanceof ApplicantPrincipal principal) {
+            return principal;
+        }
+        throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Sign in with your registration username and password");
+    }
+
+    /** Restricted status view for a signed-in applicant; exposes only the applicant's own request. */
+    @GetMapping("/api/applicant/registration")
+    Object applicantRegistration(Authentication authentication) {
+        ApplicantPrincipal principal = applicant(authentication);
+        Map<String, Object> row = db.queryForMap("""
+                select id,status,full_name,normalized_roll,email,username,department,batch,
+                       rejection_reason,submitted_at,reviewed_at
+                from student_registration_requests where id=? and purged_at is null
+                """, principal.requestId());
+        Map<String, Object> response = new java.util.LinkedHashMap<>();
+        response.put("reference", row.get("id"));
+        response.put("status", row.get("status"));
+        response.put("name", row.get("full_name"));
+        response.put("roll", row.get("normalized_roll"));
+        response.put("email", row.get("email"));
+        response.put("username", row.get("username"));
+        response.put("department", row.get("department"));
+        response.put("batch", row.get("batch"));
+        response.put("rejectionReason", row.get("rejection_reason"));
+        response.put("submittedAt", row.get("submitted_at") == null ? null : row.get("submitted_at").toString());
+        response.put("reviewedAt", row.get("reviewed_at") == null ? null : row.get("reviewed_at").toString());
+        response.put("signInAgain", "APPROVED".equals(row.get("status")));
+        return response;
+    }
+
+    record ApplicantResubmission(String name, String roll, String email, String department, String batch,
+            String newPassword) {}
+
+    /** Lets a signed-in applicant correct and resubmit a rejected request. The username is unchanged. */
+    @Transactional
+    @PostMapping("/api/applicant/registration/resubmit")
+    Object applicantResubmit(@RequestBody ApplicantResubmission request, Authentication authentication,
+            HttpServletRequest servletRequest) {
+        ApplicantPrincipal principal = applicant(authentication);
+        rateLimit(servletRequest, "applicant-resubmission", 5);
+        if (request == null) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Application details are required");
+        Map<String, Object> existing = db.queryForMap(
+                "select status,normalized_username,password_hash from student_registration_requests where id=? for update",
+                principal.requestId());
+        if (!"REJECTED".equals(existing.get("status"))) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Only rejected applications can be resubmitted");
+        }
+        boolean newPassword = request.newPassword() != null && !request.newPassword().isEmpty();
+        String username = (String) existing.get("normalized_username");
+        validateRegistration(request.name(), request.roll(), request.email(), username,
+                newPassword ? request.newPassword() : "unchanged-placeholder");
+        if (request.department() != null && request.department().trim().length() > 120
+                || request.batch() != null && request.batch().trim().length() > 80) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Academic details are too long");
+        }
+        String email = normalizeEmail(request.email());
+        String roll = normalizeRoll(request.roll());
+        ensureAccountIdentifiersAvailable(username, email);
+        if (db.queryForObject("select count(*) from student_registration_requests where status='PENDING_APPROVAL' "
+                        + "and id<>? and (normalized_username=? or normalized_email=? or normalized_roll=?)",
+                Integer.class, principal.requestId(), username, email, roll) > 0) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "A request with these details is already pending");
+        }
+        UUID candidate = db.query(
+                "select id from students where upper(regexp_replace(btrim(roll),'\\s+','','g'))=?",
+                rs -> rs.next() ? UUID.fromString(rs.getString(1)) : null, roll);
+        try {
+            db.update("""
+                    update student_registration_requests set full_name=?,normalized_roll=?,email=?,normalized_email=?,
+                        password_hash=?,department=?,batch=?,candidate_student_id=?,
+                        status='PENDING_APPROVAL',rejection_reason=null,reviewer=null,reviewed_at=null,
+                        student_id=null,submitted_at=now(),purge_after=null,purged_at=null
+                    where id=? and status='REJECTED'
+                    """, request.name().trim(), roll, email, email,
+                    newPassword ? passwordEncoder.encode(request.newPassword()) : existing.get("password_hash"),
+                    blankToNull(request.department()), blankToNull(request.batch()), candidate, principal.requestId());
+        } catch (DataIntegrityViolationException exception) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "A request with these details is already pending");
+        }
+        return applicantRegistration(authentication);
+    }
+
 
     private String blankToNull(String value) {
         return value == null || value.isBlank() ? null : value.trim();
@@ -479,6 +566,7 @@ public class StudentPortal {
         int updated = db.update("update student_accounts set active=?,account_status=?,updated_at=now() where student_id=?",
                 request.active(), request.active() ? "APPROVED" : "DEACTIVATED", id);
         if (updated != 1) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Student account not found");
+        if (!request.active()) tokens.revokeAllForStudent(id);
         return Map.of("active", request.active());
     }
 
@@ -497,6 +585,7 @@ public class StudentPortal {
                         + "where student_id=? and active=true and account_status='APPROVED'",
                 passwordEncoder.encode(request.temporaryPassword()), id);
         if (updated != 1) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Active student account not found");
+        tokens.revokeAllForStudent(id);
         return Map.of("passwordReset", true, "mustChangePassword", true);
     }
 
@@ -521,6 +610,26 @@ public class StudentPortal {
             throw new ResponseStatusException(HttpStatus.CONFLICT, "Another student profile uses this email");
         }
         return Map.of("updated", true);
+    }
+
+    record ConsentRecord(boolean consent) {}
+
+    /**
+     * Records (or revokes) biometric consent collected in person by an administrator, for an
+     * existing profile. Revocation goes through the regular face-deletion endpoint, which also
+     * removes templates; this endpoint only accepts recording consent.
+     */
+    @PostMapping("/api/students/{id}/consent")
+    Object recordConsent(@PathVariable UUID id, @RequestBody ConsentRecord request, Authentication authentication) {
+        requireAdmin(authentication);
+        if (request == null || !request.consent()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "To withdraw consent, delete the student's face enrollment instead");
+        }
+        int updated = db.update("update students set consent=true,consent_updated_at=now(),consent_source='ADMIN' "
+                + "where id=? and archived=false", id);
+        if (updated != 1) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Active student profile not found");
+        return Map.of("consent", true);
     }
 
     record PasswordChange(String currentPassword, String newPassword, String confirmPassword) {}
@@ -549,6 +658,8 @@ public class StudentPortal {
         }
         db.update("update student_accounts set password_hash=?,must_change_password=false,updated_at=now() where id=?",
                 passwordEncoder.encode(request.newPassword()), account.get("id"));
+        // Sign out other devices; the device that changed the password stays signed in.
+        tokens.revokeAll(authentication.getName(), ApiTokenService.currentTokenId(authentication));
         return Map.of("passwordChanged", true, "mustChangePassword", false);
     }
 
@@ -686,7 +797,8 @@ public class StudentPortal {
             UUID studentId, UUID offeringId, java.time.LocalDate fromDate, java.time.LocalDate toDate,
             String status, int page, int size) {
         validateDateRange(fromDate, toDate);
-        if (page < 0 || page > 100_000 || size < 1 || size > 200
+        // Pages are limited to 200 rows; the CSV export reads up to 10,000 rows in one internal call.
+        if (page < 0 || page > 100_000 || size < 1 || size > 200 && size != 10_000
                 || !List.of("ALL", "PRESENT", "ABSENT").contains(status)) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid attendance pagination or status filter");
         }

@@ -4,6 +4,8 @@ import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -53,6 +55,7 @@ final class FacePhotoUploadException extends RuntimeException {
 }
 
 @RestControllerAdvice
+@Order(Ordered.HIGHEST_PRECEDENCE)
 class FacePhotoUploadAdvice {
     @ExceptionHandler(FacePhotoUploadException.class)
     ResponseEntity<Map<String, Object>> handle(FacePhotoUploadException failure) {

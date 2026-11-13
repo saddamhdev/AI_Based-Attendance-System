@@ -29,6 +29,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  void audit(UUID id,Authentication a,String action){db.update("insert into audit(session_id,actor,action) values(?,?,?)",id,a.getName(),action);}
  void adminDeletion(String type,UUID id,Authentication a,String action){db.update("insert into administrative_deletions(entity_type,entity_id,actor,action) values(?,?,?,?)",type,id,a.getName(),action);}
  @GetMapping("/me") Object me(Authentication a){
+  if(a.getPrincipal() instanceof ApplicantPrincipal applicant){
+   var request=db.queryForMap("select status from student_registration_requests where id=?",applicant.requestId());
+   var out=new LinkedHashMap<String,Object>();out.put("username",a.getName());out.put("admin",false);out.put("student",false);
+   out.put("applicant",true);out.put("role","APPLICANT");out.put("registrationId",applicant.requestId());
+   out.put("registrationStatus",request.get("status"));out.put("mustChangePassword",false);return out;
+  }
   if(admin(a))return Map.of("username",a.getName(),"admin",true,"student",false,"role","ADMIN","mustChangePassword",false);
   var account=db.queryForList("select a.student_id,a.must_change_password,s.name,s.roll from student_accounts a join students s on s.id=a.student_id where lower(a.username)=lower(?) and a.active=true and a.account_status='APPROVED' and s.archived=false",a.getName());
   if(!account.isEmpty()){var row=account.get(0);return Map.of("username",a.getName(),"admin",false,"student",true,"role","STUDENT","studentId",row.get("student_id"),"name",row.get("name"),"roll",row.get("roll"),"mustChangePassword",row.get("must_change_password"));}
@@ -56,6 +62,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
   UUID previousEnrollment=db.query("select id from student_enrollments where student_id=? and status='ACTIVE'",
     rs->rs.next()?rs.getObject(1,UUID.class):null,id);
   boolean previous=previousEnrollment!=null;
+  var replay=replayedSubmission(submissionId,id,label,previous,true);if(replay!=null)return replay;
   if(!Boolean.TRUE.equals(row.get("consent"))||!consent)throw FacePhotoUploadException.known(
     HttpStatus.FORBIDDEN,"CONSENT_OR_IDENTITY_REQUIRED",
     "Verify the student’s identity and confirm recorded consent before submitting photos.",label,previous);
@@ -95,6 +102,21 @@ import com.fasterxml.jackson.databind.ObjectMapper;
   }
  }
  record StoredPhoto(UUID id,String key,String thumb,int index,int width,int height){}
+ /** Returns the stored outcome when a client retries a submission it already completed, so a retry
+  *  after a lost response never re-stages (and then cleans up) an enrollment that already exists. */
+ Map<String,Object> replayedSubmission(String submissionId,UUID student,String label,boolean previous,boolean adminFlow){
+  if(submissionId==null||submissionId.isBlank())return null;
+  UUID id=parseSubmissionId(submissionId,label,previous);
+  var rows=db.queryForList("select student_id,status,accepted_photo_count,submission_source from student_enrollments where id=?",id);
+  if(rows.isEmpty())return null;
+  var row=rows.get(0);
+  if(!student.equals(row.get("student_id"))||adminFlow!="ADMIN".equals(row.get("submission_source")))
+   throw FacePhotoUploadException.known(HttpStatus.CONFLICT,"SUBMISSION_ID_REUSED",
+     "This submission was already used. Start a new photo submission.",label,previous);
+  var out=new LinkedHashMap<String,Object>();out.put("enrollmentId",id);out.put("submissionId",id);out.put("studentId",student);
+  out.put("status",row.get("status"));out.put("acceptedPhotoCount",row.get("accepted_photo_count"));out.put("replayed",true);
+  return out;
+ }
  UUID parseSubmissionId(String value,String label,boolean previous){
   if(value==null||value.isBlank())return UUID.randomUUID();
   try{return UUID.fromString(value);}
@@ -171,6 +193,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
   String label=profile.get("name")+" ("+profile.get("roll")+")";
   boolean previous=Boolean.TRUE.equals(db.queryForObject(
     "select count(*)>0 from student_enrollments where student_id=? and status='ACTIVE'",Boolean.class,student));
+  var replay=replayedSubmission(submissionId,student,label,previous,false);if(replay!=null)return replay;
   if(!consent)throw FacePhotoUploadException.known(HttpStatus.BAD_REQUEST,"CONSENT_REQUIRED",
     "Give explicit biometric consent before submitting photos.",label,previous);
   if(files.size()<5||files.size()>10)throw FacePhotoUploadException.known(HttpStatus.BAD_REQUEST,
@@ -293,7 +316,26 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  @Transactional @DeleteMapping("/sessions/{id}/substitute/{teacherId}") Object revokeSubstitute(@PathVariable UUID id,@PathVariable UUID teacherId,Authentication a){adminOnly(a);var s=db.queryForMap("select id,status from sessions where id=? for update",id);draft(s);int updated=db.update("update session_substitute_authorizations set revoked_at=now() where session_id=? and teacher_id=? and revoked_at is null",id,teacherId);check(updated==1,"Active substitute authorization not found");audit(id,a,"SUBSTITUTE_REVOKED "+teacherId);return Map.of("revoked",true);}
  @PutMapping("/sessions/{id}") @Transactional Object save(@PathVariable UUID id,@RequestBody Edit x,Authentication a){var s=session(id,a);draft(s);check(((Number)s.get("version")).intValue()==x.version(),"Draft changed. Reload before saving.");for(var e:x.states().entrySet()){check(Set.of("PRESENT","ABSENT","UNCONFIRMED").contains(e.getValue()),"Invalid state");String source=x.sources()==null?"MANUAL":x.sources().getOrDefault(e.getKey(),"MANUAL");check(Set.of("NONE","AI","MANUAL").contains(source),"Invalid decision source");check(db.update("update attendance set state=?,decision_source=? where session_id=? and student_id=?",e.getValue(),source,id,e.getKey())==1,"Student outside roster");}db.update("update sessions set version=version+1,status='IN_REVIEW' where id=?",id);audit(id,a,"DRAFT_SAVED "+x.states());return get(id,a);}
  @PostMapping("/sessions/{id}/confirm") @Transactional Object confirm(@PathVariable UUID id,@RequestBody Map<String,Integer> x,Authentication a){var s=session(id,a);if(s.get("status").equals("FINALIZED"))return get(id,a);check(Objects.equals(s.get("version"),x.get("version")),"Draft changed. Reload.");check(db.queryForObject("select count(*) from attendance where session_id=?",Integer.class,id)>0,"Empty roster");check(db.queryForObject("select count(*) from attendance where session_id=? and state='UNCONFIRMED'",Integer.class,id)==0,"Review every student first");db.update("update sessions set status='FINALIZED',version=version+1 where id=?",id);audit(id,a,"FINALIZED");return get(id,a);}
- @PostMapping("/sessions/{id}/recognize") @Transactional Object recognize(@PathVariable UUID id,@RequestParam("images") List<MultipartFile> files,Authentication a)throws Exception{var s=session(id,a);draft(s);check(files.size()>=1&&files.size()<=3,"Upload 1–3 photos");double threshold=recognitionSettings.threshold(a);var ids=db.queryForList("select distinct a.student_id from attendance a join students s on s.id=a.student_id join student_enrollments e on e.student_id=s.id and e.status='ACTIVE' where a.session_id=? and s.consent=true and s.archived=false",UUID.class,id);var body=new LinkedMultiValueMap<String,Object>();body.add("studentIds",String.join(",",ids.stream().map(UUID::toString).toList()));body.add("thresholdPercentage",Double.toString(threshold));for(var f:files)body.add("images",resource(f));Map<String,Object> response=ai().post().uri("/recognize").contentType(MediaType.MULTIPART_FORM_DATA).body(body).retrieve().body(Map.class);if(response==null)throw new IllegalStateException("AI recognition service returned an empty response.");return recognitionSettings.saveAnalysis(id,a,threshold,response);}
+ @PostMapping("/sessions/{id}/recognize") @Transactional Object recognize(@PathVariable UUID id,@RequestParam("images") List<MultipartFile> files,Authentication a)throws Exception{var s=session(id,a);draft(s);check(files.size()>=1&&files.size()<=3,"Upload 1–3 photos");double threshold=recognitionSettings.threshold(a);var ids=db.queryForList("select distinct a.student_id from attendance a join students s on s.id=a.student_id join student_enrollments e on e.student_id=s.id and e.status='ACTIVE' where a.session_id=? and s.consent=true and s.archived=false",UUID.class,id);var body=new LinkedMultiValueMap<String,Object>();body.add("studentIds",String.join(",",ids.stream().map(UUID::toString).toList()));body.add("thresholdPercentage",Double.toString(threshold));for(var f:files)body.add("images",resource(f));Map<String,Object> response;
+  try{response=ai().post().uri("/recognize").contentType(MediaType.MULTIPART_FORM_DATA).body(body).retrieve().body(Map.class);}
+  catch(RestClientResponseException failure){throw recognitionFailure(failure);}
+  catch(ResourceAccessException failure){throw new ApiProblemException(HttpStatus.SERVICE_UNAVAILABLE,"AI_TIMEOUT_OR_UNAVAILABLE","Face recognition timed out or is unavailable. Your attendance draft is unchanged; retry or take attendance manually.");}
+  if(response==null)throw new ApiProblemException(HttpStatus.BAD_GATEWAY,"AI_EMPTY_RESPONSE","Face recognition returned no result. Retry or take attendance manually.");
+  return recognitionSettings.saveAnalysis(id,a,threshold,response);}
+ /** Maps a Python /recognize error to a client-safe classroom-photo problem. */
+ ApiProblemException recognitionFailure(RestClientResponseException failure){
+  String code="RECOGNITION_FAILED",message="Face recognition could not be completed. Retry or take attendance manually.";Integer photoIndex=null;
+  try{var root=objectMapper.readTree(failure.getResponseBodyAsByteArray());var detail=root.path("detail");
+   if(detail.isObject()){code=detail.path("code").asText(code);if(detail.has("photoIndex"))photoIndex=detail.path("photoIndex").asInt();
+    if(detail.hasNonNull("message"))message=detail.path("message").asText();}}
+  catch(Exception unreadable){LOG.warning("Face recognition returned an unreadable error response.");}
+  int status=failure.getStatusCode().value();
+  if(status==503)return new ApiProblemException(HttpStatus.SERVICE_UNAVAILABLE,"AI_MODEL_UNAVAILABLE","Face recognition is temporarily unavailable. Take attendance manually or retry later.");
+  if(status>=500)return new ApiProblemException(HttpStatus.BAD_GATEWAY,"RECOGNITION_FAILED","Face recognition could not be completed. Retry or take attendance manually.");
+  var extra=new LinkedHashMap<String,Object>();if(photoIndex!=null)extra.put("photoIndex",photoIndex);
+  String prefix=photoIndex==null?"A classroom photo could not be analyzed: ":"Classroom photo "+photoIndex+" could not be analyzed: ";
+  return new ApiProblemException(HttpStatus.UNPROCESSABLE_ENTITY,code,prefix+message,extra);
+ }
  @GetMapping(value="/reports.csv",produces="text/csv") Object report(Authentication a){var rows=admin(a)?db.queryForList("select c.name,a.roll,a.student_name,count(*) total,count(*) filter(where a.state='PRESENT') present from attendance a join sessions s on s.id=a.session_id join courses c on c.id=s.course_id where s.status='FINALIZED' group by c.name,a.roll,a.student_name"):db.queryForList("select c.name,a.roll,a.student_name,count(*) total,count(*) filter(where a.state='PRESENT') present from attendance a join sessions s on s.id=a.session_id join courses c on c.id=s.course_id where s.status='FINALIZED' and c.teacher=? group by c.name,a.roll,a.student_name",a.getName());var out=new StringBuilder("Course,Roll,Name,Finalized sessions,Present,Percentage\n");for(var row:rows){for(String k:List.of("name","roll","student_name","total","present"))out.append(csv(row.get(k))).append(',');out.append(100.0*((Number)row.get("present")).doubleValue()/((Number)row.get("total")).doubleValue()).append('\n');}return out.toString();}
  String csv(Object x){String v=String.valueOf(x);if(v.matches("^[=+@-].*"))v="'"+v;return "\""+v.replace("\"","\"\"")+"\"";}
  ByteArrayResource resource(MultipartFile f)throws Exception{return new ByteArrayResource(f.getBytes()){@Override public String getFilename(){return "upload.jpg";}};}
